@@ -31,8 +31,8 @@ if _cfg.exists():
             if _v.strip():
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TG_TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ALLOWED = {s.strip() for s in os.environ.get("ALLOWED_USER_IDS", "").split(",") if s.strip()}
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS") or 0)  # 0 = работать постоянно
 OWNER_FILE = HERE / "owner.txt"
