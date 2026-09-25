@@ -155,6 +155,15 @@ def send(chat_id, text, reply_to=None):
             tg("sendMessage", **params)
 
 
+def drop_status(chat_id, status_id):
+    """Удаляет сообщение «идёт обработка», когда пост готов."""
+    if status_id:
+        try:
+            tg("deleteMessage", chat_id=chat_id, message_id=status_id)
+        except Exception:
+            pass
+
+
 def handle(group):
     """group - список сообщений (альбом = несколько сообщений с общим media_group_id)."""
     first = group[0]
@@ -174,25 +183,44 @@ def handle(group):
         return
 
     reply = first.get("reply_to_message")
-    if reply and reply.get("from", {}).get("is_bot") and not any("photo" in m for m in group):
-        content = [{"type": "text", "text": f"Вот пост:\n\n{reply.get('text', '')}\n\nПерепиши его в стиле канала с учётом пожелания автора: {notes}\n\nЕсли автор дописала факты — используй их."}]
+    is_edit = bool(reply and reply.get("from", {}).get("is_bot") and not any("photo" in m for m in group))
+    has_photo = any("photo" in m or m.get("document", {}).get("mime_type", "").startswith("image/") for m in group)
+    if is_edit:
+        status_text = "✏️ Переписываю пост…"
+    elif has_photo:
+        n = sum(1 for m in group if "photo" in m or "document" in m)
+        status_text = ("📸 Фото получено" if n == 1 else f"📸 Получено фото: {n}") + ". Ищу информацию и пишу пост, это займёт до минуты…"
     else:
-        photos = [m["photo"][-1]["file_id"] for m in group if "photo" in m][:MAX_IMAGES]
-        photos += [m["document"]["file_id"] for m in group if m.get("document", {}).get("mime_type", "").startswith("image/")][: MAX_IMAGES - len(photos)]
-        if not photos and not notes:
-            send(chat_id, HELP)
-            return
-        content = []
-        for fid in photos:
-            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": download_photo(fid)}})
-        content.append({"type": "text", "text": "Напиши пост для канала по этим фото." + (f"\n\nЗаметки автора:\n{notes}" if notes else "\n\nЗаметок нет — опирайся на фото.")})
-
-    tg("sendChatAction", chat_id=chat_id, action="typing")
+        status_text = "⏳ Ищу информацию и пишу пост, это займёт до минуты…"
+    status_id = None
+    if is_edit or has_photo or notes:
+        try:
+            status_id = tg("sendMessage", chat_id=chat_id, text=status_text,
+                           reply_parameters={"message_id": first["message_id"], "allow_sending_without_reply": True})["message_id"]
+        except Exception:
+            pass
     try:
+        if is_edit:
+            content = [{"type": "text", "text": f"Вот пост:\n\n{reply.get('text', '')}\n\nПерепиши его в стиле канала с учётом пожелания автора: {notes}\n\nЕсли автор дописала факты — используй их."}]
+        else:
+            photos = [m["photo"][-1]["file_id"] for m in group if "photo" in m][:MAX_IMAGES]
+            photos += [m["document"]["file_id"] for m in group if m.get("document", {}).get("mime_type", "").startswith("image/")][: MAX_IMAGES - len(photos)]
+            if not photos and not notes:
+                drop_status(chat_id, status_id)
+                send(chat_id, HELP)
+                return
+            content = []
+            for fid in photos:
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": download_photo(fid)}})
+            content.append({"type": "text", "text": "Напиши пост для канала по этим фото." + (f"\n\nЗаметки автора:\n{notes}" if notes else "\n\nЗаметок нет — опирайся на фото.")})
+
+        tg("sendChatAction", chat_id=chat_id, action="typing")
         post = ask_claude(content)
     except Exception as e:
-        send(chat_id, f"Не получилось сгенерировать пост: {str(e)[:300]}")
+        drop_status(chat_id, status_id)
+        send(chat_id, f"❌ Не получилось сгенерировать пост: {str(e)[:300]}\nПопробуйте отправить ещё раз.")
         raise
+    drop_status(chat_id, status_id)
     note = ""
     if "NOTE:" in post:
         post, note = post.split("NOTE:", 1)
