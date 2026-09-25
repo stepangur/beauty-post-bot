@@ -1,0 +1,39 @@
+name: beauty-post-bot
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # каждый час; пока один запуск работает, следующий ждёт в очереди
+  workflow_dispatch: {}   # ручной запуск кнопкой Run workflow
+
+concurrency:
+  group: beauty-post-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Не дать GitHub отключить расписание (раз в 50 дней пустой коммит)
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt 4320000 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi
+
+      - name: Бот (работает ~5 ч 45 мин, затем его сменяет следующий запуск)
+        run: python3 bot.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          POLL_SECONDS: "20700"
