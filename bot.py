@@ -104,14 +104,33 @@ SYSTEM = [
 ]
 
 
-def ask_claude(content):
-    res = http(
-        "https://api.anthropic.com/v1/messages",
-        {"model": model(), "max_tokens": 2000, "system": SYSTEM, "messages": [{"role": "user", "content": content}]},
-        headers=claude_headers(),
-        timeout=180,
-    )
-    return "".join(b.get("text", "") for b in res["content"]).strip()
+WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 6}
+
+
+def ask_claude(content, search=True):
+    """Запрос к Claude. С search=True модель сначала ищет в интернете реальную информацию."""
+    messages = [{"role": "user", "content": content}]
+    body = {"model": model(), "max_tokens": 4000, "system": SYSTEM, "messages": messages}
+    if search:
+        body["tools"] = [WEB_SEARCH]
+    for _ in range(4):  # pause_turn: модель просит продолжить долгий поиск
+        try:
+            res = http("https://api.anthropic.com/v1/messages", body, headers=claude_headers(), timeout=300)
+        except RuntimeError as e:
+            if search and "web_search" in str(e):  # поиск недоступен — пишем без него
+                log(f"Поиск недоступен: {e}")
+                body.pop("tools", None)
+                search = False
+                continue
+            raise
+        if res.get("stop_reason") == "pause_turn":
+            messages.append({"role": "assistant", "content": res["content"]})
+            continue
+        break
+    blocks = res["content"]
+    # берём только текст после последнего результата поиска (без «сейчас поищу…»)
+    last = max([i for i, b in enumerate(blocks) if b.get("type") == "web_search_tool_result"], default=-1)
+    return "".join(b.get("text", "") for b in blocks[last + 1 :] if b.get("type") == "text").strip()
 
 
 # ---------- Логика ----------
