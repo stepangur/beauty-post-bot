@@ -47,6 +47,18 @@ TG = f"https://api.telegram.org/bot{TG_TOKEN}"
 MAX_IMAGES = 5
 VARIANT_SEP = "===ВАРИАНТ==="
 
+POST_BUTTONS = {
+    "inline_keyboard": [[
+        {"text": "✏️ Короче", "callback_data": "ei_short"},
+        {"text": "✏️ Добавь цену", "callback_data": "ei_price"},
+        {"text": "🔄 Ещё вариант", "callback_data": "ei_more"},
+    ]]
+}
+EDIT_INSTRUCTIONS = {
+    "ei_short": "сделай его короче, убери не самое важное",
+    "ei_price": "добавь цену, если она не указана — поищи её в интернете",
+}
+
 
 # ---------- HTTP ----------
 def http(url, data=None, headers=None, timeout=120, method=None):
@@ -116,6 +128,35 @@ def _entities_to_html(entities):
             out.append(f"<{_ENTITY_TAGS[t]}>{txt}</{_ENTITY_TAGS[t]}>")
         else:
             out.append(txt)
+    return "".join(out)
+
+
+def tg_entities_to_html(text, entities):
+    """Восстанавливает Telegram HTML из текста сообщения + entities (формат Bot API,
+    офсеты в UTF-16 code units) — используется, когда нажата инлайн-кнопка под постом."""
+    text = text or ""
+    if not entities:
+        return text
+    u16 = text.encode("utf-16-le")
+
+    def cut(a, b):
+        return u16[a * 2 : b * 2].decode("utf-16-le", errors="ignore")
+
+    out, pos = [], 0
+    for e in sorted(entities, key=lambda e: e["offset"]):
+        start, end = e["offset"], e["offset"] + e["length"]
+        if start < pos:
+            continue  # пропускаем вложенные/перекрывающиеся — в наших постах их не бывает
+        out.append(cut(pos, start))
+        seg = cut(start, end)
+        tag = _ENTITY_TAGS.get(e.get("type"))
+        if tag:
+            seg = f"<{tag}>{seg}</{tag}>"
+        elif e.get("type") in ("blockquote", "expandable_blockquote"):
+            seg = f"<blockquote>{seg}</blockquote>"
+        out.append(seg)
+        pos = end
+    out.append(cut(pos, len(u16) // 2))
     return "".join(out)
 
 
@@ -217,19 +258,22 @@ HELP = (
     "Пришлите фото (или несколько одним альбомом) и в подписи напишите заметки: "
     "бренд, название, впечатления, цену, адрес — всё, что важно. В ответ придут "
     + (f"{VARIANTS} варианта готового поста." if VARIANTS > 1 else "готовый пост.") + "\n\n"
-    "Чтобы поправить пост — ответьте (reply) на него с пожеланием, например: «короче», «добавь вопрос в конце».\n"
+    "Под каждым постом — кнопки «Короче», «Добавь цену», «Ещё вариант», можно просто нажать.\n"
+    "А для другой правки — ответьте (reply) на пост с пожеланием, например: «добавь вопрос в конце».\n"
     "Без фото тоже можно: просто пришлите заметки текстом.\n\n"
     "Чтобы обновить стиль по новому экспорту канала — пришлите файл result.json "
     "(Telegram Desktop → ⋮ у канала → Экспорт истории чата → JSON)."
 )
 
 
-def send(chat_id, text, reply_to=None):
-    for i in range(0, len(text), 4000):
-        chunk = text[i : i + 4000]
+def send(chat_id, text, reply_to=None, buttons=False):
+    chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)] or [""]
+    for i, chunk in enumerate(chunks):
         params = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}}
         if reply_to:
             params["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        if buttons and i == len(chunks) - 1:  # кнопки только под последним куском длинного поста
+            params["reply_markup"] = POST_BUTTONS
         try:
             tg("sendMessage", **params)
         except RuntimeError:  # сломанная разметка — отправим как простой текст
@@ -301,6 +345,45 @@ def do_update_style(chat_id, doc, reply_to):
         drop_status(chat_id, status_id)
         send(chat_id, f"❌ Не получилось обновить стиль: {str(e)[:300]}")
         raise
+
+
+def handle_callback(cq):
+    """Нажатие на инлайн-кнопку под постом («Короче» / «Добавь цену» / «Ещё вариант»)."""
+    user_id = str(cq.get("from", {}).get("id", ""))
+    msg = cq.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    data = cq.get("data", "")
+    if not chat_id:
+        return
+    if user_id not in ALLOWED:
+        try:
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Доступ закрыт", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text="Переписываю…")
+    except Exception:
+        pass
+    original = tg_entities_to_html(msg.get("text"), msg.get("entities"))
+    if not original.strip():
+        return
+    if data == "ei_more":
+        instruction = "Напиши ещё один вариант этого же поста: другой заголовок и ракурс подачи, но те же факты и тот же стиль канала."
+        search = False
+    else:
+        instruction = f"Перепиши его в стиле канала: {EDIT_INSTRUCTIONS.get(data, 'поправь его')}."
+        search = data == "ei_price"
+    try:
+        tg("sendChatAction", chat_id=chat_id, action="typing")
+        content = [{"type": "text", "text": f"Вот пост:\n\n{original}\n\n{instruction}"}]
+        new_post = ask_claude(content, search=search)
+    except Exception as e:
+        send(chat_id, f"❌ Не получилось переписать: {str(e)[:300]}", reply_to=msg.get("message_id"))
+        return
+    new_post = new_post.replace("<post>", "").replace("</post>", "").strip()
+    if new_post:
+        send(chat_id, new_post, reply_to=msg.get("message_id"), buttons=True)
 
 
 def handle(group):
@@ -390,9 +473,9 @@ def handle(group):
         variants = [post.strip()]
     if len(variants) > 1:
         for i, v in enumerate(variants, 1):
-            send(chat_id, f"<b>Вариант {i}</b>\n\n{v}", reply_to=first["message_id"])
+            send(chat_id, f"<b>Вариант {i}</b>\n\n{v}", reply_to=first["message_id"], buttons=True)
     else:
-        send(chat_id, variants[0], reply_to=first["message_id"])
+        send(chat_id, variants[0], reply_to=first["message_id"], buttons=True)
     if note:
         send(chat_id, "💡 " + note)
 
@@ -400,9 +483,13 @@ def handle(group):
 def process(updates):
     if any(u.get("message", {}).get("media_group_id") for u in updates):
         time.sleep(2)  # даём альбому догрузиться
-        updates += tg("getUpdates", offset=updates[-1]["update_id"] + 1, timeout=0, allowed_updates=["message"])
+        updates += tg("getUpdates", offset=updates[-1]["update_id"] + 1, timeout=0, allowed_updates=["message", "callback_query"])
     groups, order = {}, []  # собираем альбомы вместе
+    callbacks = []
     for u in updates:
+        if u.get("callback_query"):
+            callbacks.append(u["callback_query"])
+            continue
         m = u.get("message")
         if not m:
             continue
@@ -413,6 +500,12 @@ def process(updates):
         groups[key].append(m)
     offset = updates[-1]["update_id"] + 1
     tg("getUpdates", offset=offset, timeout=0)  # подтверждаем, чтобы не обработать дважды
+    for cq in callbacks:
+        try:
+            handle_callback(cq)
+            log(f"Обработан callback от {cq.get('from', {}).get('id')}: {cq.get('data')}")
+        except Exception as e:
+            log(f"Ошибка callback: {e}")
     for key in order:
         try:
             handle(groups[key])
@@ -449,7 +542,7 @@ def main():
     while deadline is None or time.time() < deadline:
         try:
             wait = 50 if deadline is None else max(0, min(25, int(deadline - time.time())))
-            updates = tg("getUpdates", offset=offset, timeout=wait, allowed_updates=["message"])
+            updates = tg("getUpdates", offset=offset, timeout=wait, allowed_updates=["message", "callback_query"])
             if updates:
                 offset = process(updates)
         except Exception as e:  # нет интернета и т.п. — ждём и пробуем снова
