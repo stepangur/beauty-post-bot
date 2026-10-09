@@ -48,16 +48,26 @@ MAX_IMAGES = 5
 VARIANT_SEP = "===ВАРИАНТ==="
 
 POST_BUTTONS = {
-    "inline_keyboard": [[
-        {"text": "✏️ Короче", "callback_data": "ei_short"},
-        {"text": "✏️ Добавь цену", "callback_data": "ei_price"},
-        {"text": "🔄 Ещё вариант", "callback_data": "ei_more"},
-    ]]
+    "inline_keyboard": [
+        [
+            {"text": "✏️ Короче", "callback_data": "ei_short"},
+            {"text": "📝 Подробнее", "callback_data": "ei_detailed"},
+            {"text": "💫 Эмоциональнее", "callback_data": "ei_emotional"},
+        ],
+        [
+            {"text": "😄 Легче", "callback_data": "ei_casual"},
+            {"text": "🔄 Ещё вариант", "callback_data": "ei_more"},
+            {"text": "✍️ Свой вариант", "callback_data": "ei_custom"},
+        ],
+    ]
 }
 EDIT_INSTRUCTIONS = {
     "ei_short": "сделай его короче, убери не самое важное",
-    "ei_price": "добавь цену, если она не указана — поищи её в интернете",
+    "ei_detailed": "сделай его подробнее, добавь больше деталей о продукте/месте (если нужно уточнить факты — поищи их в интернете)",
+    "ei_emotional": "сделай его более живым и эмоциональным, добавь личных впечатлений",
+    "ei_casual": "сделай тон легче и более разговорным",
 }
+CUSTOM_PROMPT = "✍️ Напишите, что поправить, ответом на это сообщение."
 
 
 # ---------- HTTP ----------
@@ -258,8 +268,9 @@ HELP = (
     "Пришлите фото (или несколько одним альбомом) и в подписи напишите заметки: "
     "бренд, название, впечатления, цену, адрес — всё, что важно. В ответ придут "
     + (f"{VARIANTS} варианта готового поста." if VARIANTS > 1 else "готовый пост.") + "\n\n"
-    "Под каждым постом — кнопки «Короче», «Добавь цену», «Ещё вариант», можно просто нажать.\n"
-    "А для другой правки — ответьте (reply) на пост с пожеланием, например: «добавь вопрос в конце».\n"
+    "Под каждым постом — кнопки «Короче», «Подробнее», «Эмоциональнее», «Легче», «Ещё вариант», "
+    "можно просто нажать. Кнопка «Свой вариант» попросит написать правку текстом — для того, чего нет "
+    "среди кнопок.\n"
     "Без фото тоже можно: просто пришлите заметки текстом.\n\n"
     "Чтобы обновить стиль по новому экспорту канала — пришлите файл result.json "
     "(Telegram Desktop → ⋮ у канала → Экспорт истории чата → JSON)."
@@ -348,7 +359,7 @@ def do_update_style(chat_id, doc, reply_to):
 
 
 def handle_callback(cq):
-    """Нажатие на инлайн-кнопку под постом («Короче» / «Добавь цену» / «Ещё вариант»)."""
+    """Нажатие на инлайн-кнопку под постом (стили правки, «Ещё вариант», «Свой вариант»)."""
     user_id = str(cq.get("from", {}).get("id", ""))
     msg = cq.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
@@ -358,6 +369,18 @@ def handle_callback(cq):
     if user_id not in ALLOWED:
         try:
             tg("answerCallbackQuery", callback_query_id=cq["id"], text="Доступ закрыт", show_alert=True)
+        except Exception:
+            pass
+        return
+    if data == "ei_custom":  # просим пользователя написать своё пожелание ответом на пост
+        try:
+            tg("answerCallbackQuery", callback_query_id=cq["id"])
+        except Exception:
+            pass
+        try:
+            tg("sendMessage", chat_id=chat_id, text=CUSTOM_PROMPT,
+               reply_parameters={"message_id": msg.get("message_id"), "allow_sending_without_reply": True},
+               reply_markup={"force_reply": True, "input_field_placeholder": "Что поправить?"})
         except Exception:
             pass
         return
@@ -373,7 +396,7 @@ def handle_callback(cq):
         search = False
     else:
         instruction = f"Перепиши его в стиле канала: {EDIT_INSTRUCTIONS.get(data, 'поправь его')}."
-        search = data == "ei_price"
+        search = data == "ei_detailed"
     try:
         tg("sendChatAction", chat_id=chat_id, action="typing")
         content = [{"type": "text", "text": f"Вот пост:\n\n{original}\n\n{instruction}"}]
@@ -416,6 +439,8 @@ def handle(group):
         return
 
     reply = first.get("reply_to_message")
+    if reply and (reply.get("text") or "").startswith(CUSTOM_PROMPT) and reply.get("reply_to_message"):
+        reply = reply["reply_to_message"]  # ответ на подсказку «✍️ Свой вариант» — берём исходный пост
     is_edit = bool(reply and reply.get("from", {}).get("is_bot") and not any("photo" in m for m in group))
     has_photo = any("photo" in m or m.get("document", {}).get("mime_type", "").startswith("image/") for m in group)
     if is_edit:
@@ -434,7 +459,8 @@ def handle(group):
             pass
     try:
         if is_edit:
-            content = [{"type": "text", "text": f"Вот пост:\n\n{reply.get('text', '')}\n\nПерепиши его в стиле канала с учётом пожелания автора: {notes}\n\nЕсли автор дописала факты — используй их."}]
+            original = tg_entities_to_html(reply.get("text"), reply.get("entities"))
+            content = [{"type": "text", "text": f"Вот пост:\n\n{original}\n\nПерепиши его в стиле канала с учётом пожелания автора: {notes}\n\nЕсли автор дописала факты — используй их."}]
         else:
             photos = [m["photo"][-1]["file_id"] for m in group if "photo" in m][:MAX_IMAGES]
             photos += [m["document"]["file_id"] for m in group if m.get("document", {}).get("mime_type", "").startswith("image/")][: MAX_IMAGES - len(photos)]
