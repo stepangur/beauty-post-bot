@@ -43,3 +43,5 @@ jobs:
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
           POLL_SECONDS: "20700"
+          VARIANTS_COUNT: ${{ vars.VARIANTS_COUNT }}
+          GITHUB_TOKEN: ${{ github.token }}

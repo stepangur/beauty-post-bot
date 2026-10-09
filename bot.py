@@ -10,6 +10,10 @@
   ALLOWED_USER_IDS   - ID пользователей через запятую, кому можно пользоваться ботом
   CLAUDE_MODEL       - (необязательно) модель; по умолчанию берётся новейшая Sonnet
   POLL_SECONDS       - (необязательно) сколько секунд ждать новые сообщения, по умолчанию 40
+  VARIANTS_COUNT     - (необязательно) сколько вариантов поста предлагать, по умолчанию 2
+  GITHUB_TOKEN       - (необязательно) токен с правом contents:write — чтобы команда
+                        «обновить стиль» могла сама закоммитить style.md/examples.txt
+  GITHUB_REPOSITORY  - (обычно задаётся GitHub Actions автоматически) "owner/repo"
 """
 import base64
 import json
@@ -35,19 +39,21 @@ TG_TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ALLOWED = {s.strip() for s in os.environ.get("ALLOWED_USER_IDS", "").split(",") if s.strip()}
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS") or 0)  # 0 = работать постоянно
+VARIANTS = max(1, int(os.environ.get("VARIANTS_COUNT") or 2))
 OWNER_FILE = HERE / "owner.txt"
 if not ALLOWED and OWNER_FILE.exists():
     ALLOWED = {s.strip() for s in OWNER_FILE.read_text().split(",") if s.strip()}
 TG = f"https://api.telegram.org/bot{TG_TOKEN}"
 MAX_IMAGES = 5
+VARIANT_SEP = "===ВАРИАНТ==="
 
 
 # ---------- HTTP ----------
-def http(url, data=None, headers=None, timeout=120):
+def http(url, data=None, headers=None, timeout=120, method=None):
     body = json.dumps(data).encode() if data is not None else None
     h = {"Content-Type": "application/json"} if body else {}
     h.update(headers or {})
-    req = urllib.request.Request(url, data=body, headers=h, method="POST" if body else "GET")
+    req = urllib.request.Request(url, data=body, headers=h, method=method or ("POST" if body else "GET"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
@@ -62,10 +68,74 @@ def tg(method, **params):
     return res["result"]
 
 
-def download_photo(file_id):
+def download_file_bytes(file_id):
     path = tg("getFile", file_id=file_id)["file_path"]
     with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60) as r:
-        return base64.b64encode(r.read()).decode()
+        return r.read()
+
+
+def download_photo(file_id):
+    return base64.b64encode(download_file_bytes(file_id)).decode()
+
+
+# ---------- GitHub (для команды «обновить стиль») ----------
+def github_commit_file(path, content, message):
+    """Коммитит файл в репозиторий бота через Contents API. Возвращает True при успехе."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not repo or not token:
+        return False
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    sha = None
+    try:
+        sha = http(url, headers=headers, timeout=30).get("sha")
+    except RuntimeError:
+        pass  # файла ещё нет — создадим новый
+    body = {"message": message, "content": base64.b64encode(content.encode()).decode()}
+    if sha:
+        body["sha"] = sha
+    http(url, body, headers=headers, method="PUT", timeout=60)
+    return True
+
+
+# ---------- Разбор экспорта чата Telegram (для команды «обновить стиль») ----------
+_ENTITY_TAGS = {"bold": "b", "italic": "i", "underline": "u", "strikethrough": "s", "code": "code"}
+
+
+def _entities_to_html(entities):
+    out = []
+    for e in entities:
+        if isinstance(e, str):
+            out.append(e)
+            continue
+        t, txt = e.get("type"), e.get("text", "")
+        if t == "blockquote":
+            out.append(f"<blockquote>{txt}</blockquote>")
+        elif t in _ENTITY_TAGS:
+            out.append(f"<{_ENTITY_TAGS[t]}>{txt}</{_ENTITY_TAGS[t]}>")
+        else:
+            out.append(txt)
+    return "".join(out)
+
+
+def extract_posts_from_export(raw, limit=25):
+    """Достаёт тексты постов (в телеграм HTML) из result.json — экспорта истории чата."""
+    data = json.loads(raw.decode("utf-8-sig"))
+    msgs = data.get("messages") if isinstance(data, dict) else data
+    posts = []
+    for m in msgs or []:
+        if m.get("type") != "message":
+            continue
+        ents = m.get("text_entities")
+        html = _entities_to_html(ents) if ents else (m.get("text") or "")
+        if not isinstance(html, str):
+            html = _entities_to_html(html)
+        html = html.strip()
+        if len(html) >= 80:  # пропускаем короткие служебные/медийные сообщения без текста
+            posts.append((m.get("date", ""), html))
+    posts.sort(key=lambda p: p[0])
+    return [h for _, h in posts[-limit:]]
 
 
 # ---------- Claude ----------
@@ -92,16 +162,25 @@ def claude_headers():
     return {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
 
 
-SYSTEM = [
-    {"type": "text", "text": (HERE / "style.md").read_text(encoding="utf-8")},
-    {
-        "type": "text",
-        "text": "Примеры настоящих постов канала по рубрикам (в Telegram HTML). Пиши так же:\n\n"
-        + (HERE / "examples.txt").read_text(encoding="utf-8")
-        + "\n\nОтвечай ТОЛЬКО текстом готового поста в Telegram HTML (и при необходимости строкой NOTE), без пояснений и без тегов <post>.",
-        "cache_control": {"type": "ephemeral"},
-    },
-]
+def _style_md():
+    return (HERE / "style.md").read_text(encoding="utf-8")
+
+
+def _examples_txt():
+    return (HERE / "examples.txt").read_text(encoding="utf-8")
+
+
+def system_prompt():
+    return [
+        {"type": "text", "text": _style_md()},
+        {
+            "type": "text",
+            "text": "Примеры настоящих постов канала по рубрикам (в Telegram HTML). Пиши так же:\n\n"
+            + _examples_txt()
+            + "\n\nОтвечай ТОЛЬКО текстом готового поста в Telegram HTML (и при необходимости строкой NOTE), без пояснений и без тегов <post>.",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
 
 
 WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 6}
@@ -110,7 +189,7 @@ WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search", "max_uses": 6
 def ask_claude(content, search=True):
     """Запрос к Claude. С search=True модель сначала ищет в интернете реальную информацию."""
     messages = [{"role": "user", "content": content}]
-    body = {"model": model(), "max_tokens": 4000, "system": SYSTEM, "messages": messages}
+    body = {"model": model(), "max_tokens": 4000, "system": system_prompt(), "messages": messages}
     if search:
         body["tools"] = [WEB_SEARCH]
     for _ in range(4):  # pause_turn: модель просит продолжить долгий поиск
@@ -136,9 +215,12 @@ def ask_claude(content, search=True):
 # ---------- Логика ----------
 HELP = (
     "Пришлите фото (или несколько одним альбомом) и в подписи напишите заметки: "
-    "бренд, название, впечатления, цену, адрес — всё, что важно. В ответ придёт готовый пост.\n\n"
+    "бренд, название, впечатления, цену, адрес — всё, что важно. В ответ придут "
+    + (f"{VARIANTS} варианта готового поста." if VARIANTS > 1 else "готовый пост.") + "\n\n"
     "Чтобы поправить пост — ответьте (reply) на него с пожеланием, например: «короче», «добавь вопрос в конце».\n"
-    "Без фото тоже можно: просто пришлите заметки текстом."
+    "Без фото тоже можно: просто пришлите заметки текстом.\n\n"
+    "Чтобы обновить стиль по новому экспорту канала — пришлите файл result.json "
+    "(Telegram Desktop → ⋮ у канала → Экспорт истории чата → JSON)."
 )
 
 
@@ -164,6 +246,63 @@ def drop_status(chat_id, status_id):
             pass
 
 
+def do_update_style(chat_id, doc, reply_to):
+    status_id = None
+    try:
+        status_id = tg("sendMessage", chat_id=chat_id, text="📚 Разбираю экспорт канала и обновляю стиль, это займёт пару минут…",
+                        reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True})["message_id"]
+    except Exception:
+        pass
+    try:
+        posts = extract_posts_from_export(download_file_bytes(doc["file_id"]))
+        if not posts:
+            drop_status(chat_id, status_id)
+            send(chat_id, "❌ Не нашла текстовых постов в этом файле. Нужен экспорт канала "
+                           "(Telegram Desktop → ⋮ у канала → Экспорт истории чата → формат JSON).")
+            return
+        prompt = (
+            f"Вот текущий файл style.md канала:\n\n{_style_md()}\n\n"
+            f"Вот текущий файл examples.txt (примеры постов):\n\n{_examples_txt()}\n\n"
+            f"Вот {len(posts)} новых постов из свежего экспорта канала, в хронологическом порядке от старых к новым:\n\n"
+            + "\n\n".join(f"<post>\n{p}\n</post>" for p in posts)
+            + "\n\nЗадача:\n"
+            "1. Проверь, не изменился ли стиль канала по сравнению с текущим style.md (новые приёмы, рубрики, "
+            "слова-паразиты, структура постов). Если есть заметные изменения — обнови style.md, сохранив его "
+            "структуру и примерный объём; если изменений нет — верни style.md почти без изменений.\n"
+            "2. Собери новый examples.txt: замени секцию самых свежих постов (в начале файла) на 20-25 самых "
+            "свежих и показательных постов из присланных (как есть, в Telegram HTML), обновив в заголовке секции "
+            f"указание на период — сейчас {time.strftime('%B %Y')}. Секции старых примеров по рубрикам ниже "
+            "оставь без изменений.\n\n"
+            "Ответь СТРОГО в формате, без пояснений до, между и после:\n"
+            "===STYLE.MD===\n<полный новый текст style.md>\n===EXAMPLES.TXT===\n<полный новый текст examples.txt>"
+        )
+        body = {"model": model(), "max_tokens": 16000, "messages": [{"role": "user", "content": prompt}]}
+        res = http("https://api.anthropic.com/v1/messages", body, headers=claude_headers(), timeout=280)
+        text = "".join(b.get("text", "") for b in res["content"] if b.get("type") == "text")
+        if "===STYLE.MD===" not in text or "===EXAMPLES.TXT===" not in text:
+            raise RuntimeError("модель не вернула ожидаемый формат ответа")
+        _, rest = text.split("===STYLE.MD===", 1)
+        new_style, new_examples = rest.split("===EXAMPLES.TXT===", 1)
+        new_style, new_examples = new_style.strip(), new_examples.strip()
+        (HERE / "style.md").write_text(new_style, encoding="utf-8")
+        (HERE / "examples.txt").write_text(new_examples, encoding="utf-8")
+        committed = False
+        try:
+            committed = (
+                github_commit_file("style.md", new_style, "Обновление style.md из нового экспорта канала")
+                and github_commit_file("examples.txt", new_examples, "Обновление examples.txt из нового экспорта канала")
+            )
+        except Exception as e:
+            log(f"Не удалось закоммитить обновлённый стиль на GitHub: {e}")
+        drop_status(chat_id, status_id)
+        where = "и сохранила в репозиторий на GitHub" if committed else "сохранила только локально — на GitHub нужно загрузить вручную через Upload files"
+        send(chat_id, f"✅ Разобрала {len(posts)} постов из экспорта и обновила style.md и examples.txt, {where}.")
+    except Exception as e:
+        drop_status(chat_id, status_id)
+        send(chat_id, f"❌ Не получилось обновить стиль: {str(e)[:300]}")
+        raise
+
+
 def handle(group):
     """group - список сообщений (альбом = несколько сообщений с общим media_group_id)."""
     first = group[0]
@@ -180,6 +319,17 @@ def handle(group):
         return
     if notes.startswith("/start") or notes.startswith("/help"):
         send(chat_id, HELP)
+        return
+
+    style_doc = next(
+        (m["document"] for m in group if "document" in m and not m["document"].get("mime_type", "").startswith("image/")),
+        None,
+    )
+    if style_doc and (style_doc.get("file_name", "").lower().endswith(".json") or "/updatestyle" in notes.lower()):
+        do_update_style(chat_id, style_doc, first["message_id"])
+        return
+    if notes.lower().startswith("/updatestyle"):
+        send(chat_id, "Пришлите вместе с этой командой (или отдельно) файл result.json — экспорт истории канала из Telegram Desktop.")
         return
 
     reply = first.get("reply_to_message")
@@ -212,7 +362,16 @@ def handle(group):
             content = []
             for fid in photos:
                 content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": download_photo(fid)}})
-            content.append({"type": "text", "text": "Напиши пост для канала по этим фото." + (f"\n\nЗаметки автора:\n{notes}" if notes else "\n\nЗаметок нет — опирайся на фото.")})
+            task = "Напиши пост для канала по этим фото." + (f"\n\nЗаметки автора:\n{notes}" if notes else "\n\nЗаметок нет — опирайся на фото.")
+            task += ("\n\nЕсли в заметках автора явно не указана рубрика (книга, косметика/уход, парфюм, "
+                     "ресторан/еда, мероприятие, бокс/подарок, акция, лайфстайл) — определи её сама по содержанию "
+                     "фото (обложка, упаковка, вывеска, интерьер и т.п.) и пиши строго по правилам этой рубрики из style.md.")
+            if VARIANTS > 1:
+                task += (f"\n\nСделай {VARIANTS} разных варианта подачи этого поста: разный заголовок и ракурс "
+                          "изложения, но одни и те же факты и тот же стиль канала. Раздели варианты строкой "
+                          f"{VARIANT_SEP} (каждый вариант — самостоятельный пост, без слова «вариант» внутри текста). "
+                          "Если нужна уточняющая строка NOTE — напиши её один раз в самом конце, после последнего варианта.")
+            content.append({"type": "text", "text": task})
 
         tg("sendChatAction", chat_id=chat_id, action="typing")
         post = ask_claude(content)
@@ -225,8 +384,15 @@ def handle(group):
     if "NOTE:" in post:
         post, note = post.split("NOTE:", 1)
         post, note = post.strip(), note.strip()
-    post = post.replace("<post>", "").replace("</post>", "").strip()
-    send(chat_id, post, reply_to=first["message_id"])
+    variants = [p.replace("<post>", "").replace("</post>", "").strip() for p in post.split(VARIANT_SEP)]
+    variants = [v for v in variants if v]
+    if not variants:
+        variants = [post.strip()]
+    if len(variants) > 1:
+        for i, v in enumerate(variants, 1):
+            send(chat_id, f"<b>Вариант {i}</b>\n\n{v}", reply_to=first["message_id"])
+    else:
+        send(chat_id, variants[0], reply_to=first["message_id"])
     if note:
         send(chat_id, "💡 " + note)
 
